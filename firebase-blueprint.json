@@ -1,0 +1,54 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile information including medical and cycle configuration",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "age": { "type": "integer" },
+        "birthDate": { "type": "string" },
+        "weight": { "type": "number" },
+        "height": { "type": "number" },
+        "email": { "type": "string" },
+        "lastPeriodDate": { "type": "string" },
+        "periodLength": { "type": "integer" },
+        "cycleLength": { "type": "integer" },
+        "contraceptive": { "type": "string" },
+        "isCeliac": { "type": "boolean" },
+        "hasDiabetes": { "type": "boolean" },
+        "hasObesity": { "type": "boolean" },
+        "hasDepression": { "type": "boolean" }
+      },
+      "required": ["name", "age", "birthDate", "weight", "height", "email", "lastPeriodDate", "periodLength", "cycleLength", "contraceptive"]
+    },
+    "DailyLog": {
+      "title": "DailyLog",
+      "description": "A daily check-in log with sleep, fatigue, pain, stress, mood, notes, and behaviors",
+      "type": "object",
+      "properties": {
+        "date": { "type": "string" },
+        "sleepQuality": { "type": "integer" },
+        "fatigue": { "type": "integer" },
+        "pain": { "type": "integer" },
+        "stress": { "type": "integer" },
+        "mood": { "type": "integer" },
+        "sleepDetails": { "type": "string" },
+        "additionalNotes": { "type": "string" },
+        "behavior": { "type": "string" },
+        "aiAnalysis": { "type": "string" }
+      },
+      "required": ["date", "sleepQuality", "fatigue", "pain", "stress", "mood"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Information of the registered user"
+    },
+    "/users/{userId}/logs/{date}": {
+      "schema": "DailyLog",
+      "description": "Daily symptoms and habits tracking log"
+    }
+  }
+}

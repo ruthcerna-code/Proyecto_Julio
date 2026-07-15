@@ -1,0 +1,111 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Global Safety Net: Deny all by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- REUSABLE HELPER FUNCTIONS ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // --- USER PROFILE VALIDATION ---
+    function isValidUserProfile(data) {
+      return data.name is string && data.name.size() <= 100 &&
+             data.age is int && data.age >= 0 && data.age <= 120 &&
+             data.birthDate is string && data.birthDate.size() <= 20 &&
+             data.weight is number && data.weight >= 0 && data.weight <= 500 &&
+             data.height is number && data.height >= 0 && data.height <= 300 &&
+             data.email is string && data.email.size() <= 100 &&
+             data.lastPeriodDate is string && data.lastPeriodDate.size() <= 20 &&
+             data.periodLength is int && data.periodLength >= 1 && data.periodLength <= 30 &&
+             data.cycleLength is int && data.cycleLength >= 10 && data.cycleLength <= 100 &&
+             data.contraceptive is string && data.contraceptive.size() <= 100 &&
+             (!('isCeliac' in data) || data.isCeliac is bool) &&
+             (!('hasDiabetes' in data) || data.hasDiabetes is bool) &&
+             (!('hasObesity' in data) || data.hasObesity is bool) &&
+             (!('hasDepression' in data) || data.hasDepression is bool);
+    }
+
+    function hasRequiredUserProfileFields(data) {
+      return data.keys().hasAll(['name', 'age', 'birthDate', 'weight', 'height', 'email', 'lastPeriodDate', 'periodLength', 'cycleLength', 'contraceptive']);
+    }
+
+    // --- DAILY LOG VALIDATION ---
+    function isValidDailyLog(data) {
+      return data.date is string && data.date.size() <= 20 &&
+             data.sleepQuality is int && data.sleepQuality >= 1 && data.sleepQuality <= 5 &&
+             data.fatigue is int && data.fatigue >= 1 && data.fatigue <= 5 &&
+             data.pain is int && data.pain >= 1 && data.pain <= 5 &&
+             data.stress is int && data.stress >= 1 && data.stress <= 5 &&
+             data.mood is int && data.mood >= 1 && data.mood <= 5 &&
+             (!('sleepDetails' in data) || (data.sleepDetails is string && data.sleepDetails.size() <= 2000)) &&
+             (!('additionalNotes' in data) || (data.additionalNotes is string && data.additionalNotes.size() <= 2000)) &&
+             (!('behavior' in data) || (data.behavior is string && data.behavior.size() <= 2000)) &&
+             (!('aiAnalysis' in data) || (data.aiAnalysis is string && data.aiAnalysis.size() <= 10000));
+    }
+
+    function hasRequiredDailyLogFields(data) {
+      return data.keys().hasAll(['date', 'sleepQuality', 'fatigue', 'pain', 'stress', 'mood']);
+    }
+
+    // --- COLLECTION PATH MATCHING ---
+    
+    // User Profile matching
+    match /users/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId);
+      
+      allow create: if isOwner(userId) && isValidId(userId) && isVerified() &&
+                      hasRequiredUserProfileFields(request.resource.data) &&
+                      request.resource.data.keys().size() >= 10 &&
+                      request.resource.data.keys().size() <= 14 &&
+                      isValidUserProfile(request.resource.data);
+                      
+      allow update: if isOwner(userId) && isValidId(userId) && isVerified() &&
+                      isValidUserProfile(request.resource.data) &&
+                      request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                        'name', 'age', 'birthDate', 'weight', 'height', 'email', 'lastPeriodDate',
+                        'periodLength', 'cycleLength', 'contraceptive', 'isCeliac', 'hasDiabetes',
+                        'hasObesity', 'hasDepression'
+                      ]);
+                      
+      allow delete: if isOwner(userId) && isValidId(userId);
+    }
+
+    // Daily Logs matching
+    match /users/{userId}/logs/{date} {
+      allow get: if isOwner(userId) && isValidId(userId) && isValidId(date);
+      allow list: if isOwner(userId) && isValidId(userId);
+      
+      allow create: if isOwner(userId) && isValidId(userId) && isValidId(date) && isVerified() &&
+                      hasRequiredDailyLogFields(request.resource.data) &&
+                      request.resource.data.keys().size() >= 6 &&
+                      request.resource.data.keys().size() <= 10 &&
+                      isValidDailyLog(request.resource.data);
+                      
+      allow update: if isOwner(userId) && isValidId(userId) && isValidId(date) && isVerified() &&
+                      isValidDailyLog(request.resource.data) &&
+                      request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                        'sleepQuality', 'fatigue', 'pain', 'stress', 'mood',
+                        'sleepDetails', 'additionalNotes', 'behavior', 'aiAnalysis'
+                      ]);
+                      
+      allow delete: if isOwner(userId) && isValidId(userId) && isValidId(date);
+    }
+  }
+}

@@ -8,6 +8,9 @@ import HealthProfileModal from './components/HealthProfileModal';
 import SymptomChart from './components/SymptomChart';
 import { getCycleDay, getPhaseForDay, formatDateStr, formatFriendlyDate, PHASE_DETAILS } from './utils/cycle';
 import { generateActivityForDay } from './utils/activity';
+import { auth, db, googleProvider, handleFirestoreError, OperationType, validateConnectionToFirestore } from './firebase';
+import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/auth';
+import { doc, getDoc, setDoc, deleteDoc, collection, getDocs, onSnapshot } from 'firebase/firestore';
 
 const SCALE_LABELS = {
   sleep: ["Excelente", "Buena", "Regular", "Mala", "Muy mala"],
@@ -18,6 +21,8 @@ const SCALE_LABELS = {
 };
 
 export default function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [isLoadingAuth, setIsLoadingAuth] = useState(true);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [logs, setLogs] = useState<Record<string, DailyLog>>({});
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
@@ -31,31 +36,75 @@ export default function App() {
   const [isSidebarChatOpen, setIsSidebarChatOpen] = useState(true);
   const [isEditingHealth, setIsEditingHealth] = useState(false);
 
-  // Load from local storage on mount
+  // Initialize Firebase Connection and Listen to Auth State changes on mount
   useEffect(() => {
-    try {
-      const storedProfile = localStorage.getItem('cyclia_profile');
-      const storedLogs = localStorage.getItem('cyclia_logs');
-      const storedChat = localStorage.getItem('cyclia_chat');
+    validateConnectionToFirestore();
 
-      if (storedProfile) {
-        setProfile(JSON.parse(storedProfile));
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      setIsLoadingAuth(true);
+      if (firebaseUser) {
+        setUser(firebaseUser);
+        
+        // Fetch UserProfile from Firestore
+        const profilePath = `users/${firebaseUser.uid}`;
+        try {
+          const profileDoc = await getDoc(doc(db, 'users', firebaseUser.uid));
+          if (profileDoc.exists()) {
+            setProfile(profileDoc.data() as UserProfile);
+          } else {
+            setProfile(null);
+          }
+        } catch (error) {
+          handleFirestoreError(error, OperationType.GET, profilePath);
+        }
+
+        // Fetch DailyLogs from Firestore subcollection using onSnapshot for real-time tracking
+        const logsPath = `users/${firebaseUser.uid}/logs`;
+        const unsubscribeLogs = onSnapshot(collection(db, 'users', firebaseUser.uid, 'logs'), (snapshot) => {
+          const fetchedLogs: Record<string, DailyLog> = {};
+          snapshot.forEach((doc) => {
+            fetchedLogs[doc.id] = doc.data() as DailyLog;
+          });
+          setLogs(fetchedLogs);
+        }, (error) => {
+          handleFirestoreError(error, OperationType.GET, logsPath);
+        });
+
+        // Load chat history from localStorage scoped per user
+        const storedChat = localStorage.getItem(`cyclia_chat_${firebaseUser.uid}`);
+        if (storedChat) {
+          setChatHistory(JSON.parse(storedChat));
+        } else {
+          setChatHistory([]);
+        }
+
+        setIsLoadingAuth(false);
+        return () => {
+          unsubscribeLogs();
+        };
+      } else {
+        setUser(null);
+        setProfile(null);
+        setLogs({});
+        setChatHistory([]);
+        setIsLoadingAuth(false);
       }
-      if (storedLogs) {
-        setLogs(JSON.parse(storedLogs));
-      }
-      if (storedChat) {
-        setChatHistory(JSON.parse(storedChat));
-      }
-    } catch (e) {
-      console.error("Error al cargar local storage:", e);
-    }
+    });
+
+    return () => unsubscribe();
   }, []);
 
-  // Sync profile to local storage
-  const handleSaveProfile = (newProfile: UserProfile) => {
+  // Sync profile to local storage and Firestore
+  const handleSaveProfile = async (newProfile: UserProfile) => {
+    if (!user) return;
     setProfile(newProfile);
-    localStorage.setItem('cyclia_profile', JSON.stringify(newProfile));
+
+    const profilePath = `users/${user.uid}`;
+    try {
+      await setDoc(doc(db, 'users', user.uid), newProfile);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, profilePath);
+    }
     
     // Automatically trigger a welcome chat message from Cyclia
     const welcomeMsg: ChatMessage = {
@@ -66,17 +115,25 @@ export default function App() {
     };
     const updatedHistory = [welcomeMsg];
     setChatHistory(updatedHistory);
-    localStorage.setItem('cyclia_chat', JSON.stringify(updatedHistory));
+    localStorage.setItem(`cyclia_chat_${user.uid}`, JSON.stringify(updatedHistory));
   };
 
-  // Sync logs to local storage
-  const handleSaveLog = (log: DailyLog) => {
+  // Sync logs to Firestore
+  const handleSaveLog = async (log: DailyLog) => {
+    if (!user) return;
+
     // Clear old AI analysis to ensure a brand-new analysis is generated and the loading spinner displays
     const logWithClearedAnalysis = { ...log, aiAnalysis: undefined };
     const updatedLogs = { ...logs, [log.date]: logWithClearedAnalysis };
     setLogs(updatedLogs);
-    localStorage.setItem('cyclia_logs', JSON.stringify(updatedLogs));
     setIsCheckinOpen(false);
+
+    const logPath = `users/${user.uid}/logs/${log.date}`;
+    try {
+      await setDoc(doc(db, 'users', user.uid, 'logs', log.date), logWithClearedAnalysis);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, logPath);
+    }
     
     // Show a quick toast notification
     setNotificationMsg("¡Registro guardado! Generando nuevo análisis...");
@@ -92,6 +149,7 @@ export default function App() {
 
   // Automatically trigger AI Analysis after check-in for deep insights
   const triggerAiAnalysis = async (currentLog: DailyLog, allLogs: Record<string, DailyLog>) => {
+    if (!user) return;
     setIsAnalyzing(true);
     try {
       const response = await fetch('/api/analyze', {
@@ -109,9 +167,13 @@ export default function App() {
       if (response.ok) {
         const data = await response.json();
         const updatedLog = { ...currentLog, aiAnalysis: data.analysis };
-        const updatedLogs = { ...allLogs, [currentLog.date]: updatedLog };
-        setLogs(updatedLogs);
-        localStorage.setItem('cyclia_logs', JSON.stringify(updatedLogs));
+        
+        const logPath = `users/${user.uid}/logs/${currentLog.date}`;
+        try {
+          await setDoc(doc(db, 'users', user.uid, 'logs', currentLog.date), updatedLog);
+        } catch (error) {
+          handleFirestoreError(error, OperationType.WRITE, logPath);
+        }
       }
     } catch (err) {
       console.error("Error auto-generando análisis IA:", err);
@@ -122,6 +184,7 @@ export default function App() {
 
   // Request analysis manually if cached analysis is empty
   const handleRequestAnalysisManually = async () => {
+    if (!user) return;
     const activeLog = logs[selectedDateStr];
     if (!activeLog) return;
 
@@ -148,9 +211,13 @@ export default function App() {
 
       const data = await response.json();
       const updatedLog = { ...activeLog, aiAnalysis: data.analysis };
-      const updatedLogs = { ...logs, [selectedDateStr]: updatedLog };
-      setLogs(updatedLogs);
-      localStorage.setItem('cyclia_logs', JSON.stringify(updatedLogs));
+      
+      const logPath = `users/${user.uid}/logs/${selectedDateStr}`;
+      try {
+        await setDoc(doc(db, 'users', user.uid, 'logs', selectedDateStr), updatedLog);
+      } catch (error) {
+        handleFirestoreError(error, OperationType.WRITE, logPath);
+      }
     } catch (err: any) {
       setAnalysisError(err.message || "Error al conectar con la IA de Cyclia.");
     } finally {
@@ -160,23 +227,38 @@ export default function App() {
 
   // Chat message callback
   const handleAddMessage = (msg: ChatMessage) => {
+    if (!user) return;
     const updatedHistory = [...chatHistory, msg];
     setChatHistory(updatedHistory);
-    localStorage.setItem('cyclia_chat', JSON.stringify(updatedHistory));
+    localStorage.setItem(`cyclia_chat_${user.uid}`, JSON.stringify(updatedHistory));
   };
 
   // Clear Chat History
   const handleClearHistory = () => {
+    if (!user) return;
     if (confirm("¿Estás segura de que deseas limpiar la conversación actual con Cyclia?")) {
       setChatHistory([]);
-      localStorage.removeItem('cyclia_chat');
+      localStorage.removeItem(`cyclia_chat_${user.uid}`);
     }
   };
 
   // Reset all app data (useful for testing)
-  const handleResetAppData = () => {
+  const handleResetAppData = async () => {
+    if (!user) return;
     if (confirm("⚠️ ¿Deseas eliminar todo tu perfil y registros históricos para empezar de nuevo?")) {
-      localStorage.clear();
+      const profilePath = `users/${user.uid}`;
+      try {
+        await deleteDoc(doc(db, 'users', user.uid));
+        
+        const logsRef = collection(db, 'users', user.uid, 'logs');
+        const querySnapshot = await getDocs(logsRef);
+        for (const logDoc of querySnapshot.docs) {
+          await deleteDoc(doc(db, 'users', user.uid, 'logs', logDoc.id));
+        }
+      } catch (error) {
+        handleFirestoreError(error, OperationType.DELETE, profilePath);
+      }
+
       setProfile(null);
       setLogs({});
       setChatHistory([]);
@@ -185,10 +267,9 @@ export default function App() {
   };
 
   // Load 15 days of authentic, phase-aligned historical logs for testing the graph
-  const handleLoadDemoData = () => {
-    if (!profile) return;
+  const handleLoadDemoData = async () => {
+    if (!profile || !user) return;
     
-    const demoLogs: Record<string, DailyLog> = {};
     const today = new Date();
     
     // Generate logs for the last 15 days to make a gorgeous chart curve!
@@ -251,7 +332,7 @@ export default function App() {
         behavior += " Escribí en mi diario de gratitud y tomé mi tiempo de relajación.";
       }
 
-      demoLogs[dateStr] = {
+      const logDoc: DailyLog = {
         date: dateStr,
         sleepQuality,
         fatigue,
@@ -264,12 +345,14 @@ export default function App() {
         aiAnalysis: `### Análisis de Tendencia - Fase ${phase}
 Basado en tus registros de la fase **${phase}** (Día ${cycleDay} del ciclo), tu cuerpo está respondiendo de manera típica. Los niveles de dolor y fatiga se correlacionan directamente con tus fluctuaciones hormonales.`
       };
+
+      const logPath = `users/${user.uid}/logs/${dateStr}`;
+      try {
+        await setDoc(doc(db, 'users', user.uid, 'logs', dateStr), logDoc);
+      } catch (error) {
+        handleFirestoreError(error, OperationType.WRITE, logPath);
+      }
     }
-    
-    // Merge with current logs
-    const updatedLogs = { ...logs, ...demoLogs };
-    setLogs(updatedLogs);
-    localStorage.setItem('cyclia_logs', JSON.stringify(updatedLogs));
     
     setNotificationMsg("¡Se han cargado 15 días de registros históricos de demostración!");
     setShowNotification(true);
@@ -297,25 +380,80 @@ Basado en tus registros de la fase **${phase}** (Día ${cycleDay} del ciclo), tu
   };
 
   // Check if they registered a new period to recalculate lastPeriodDate
-  const handleUpdatePeriodStart = (newDateStr: string) => {
-    if (!profile) return;
+  const handleUpdatePeriodStart = async (newDateStr: string) => {
+    if (!profile || !user) return;
     if (confirm(`¿Confirmas que deseas registrar el primer día de tu ciclo menstrual en la fecha ${newDateStr}? Esto actualizará las fases y cálculos.`)) {
       const updatedProfile = { ...profile, lastPeriodDate: newDateStr };
-      handleSaveProfile(updatedProfile);
+      await handleSaveProfile(updatedProfile);
       
       // Clear old cached AI analyses of the logs to prevent stale advice
       const updatedLogs = { ...logs };
-      Object.keys(updatedLogs).forEach(key => {
-        delete updatedLogs[key].aiAnalysis;
-      });
-      setLogs(updatedLogs);
-      localStorage.setItem('cyclia_logs', JSON.stringify(updatedLogs));
+      for (const key of Object.keys(updatedLogs)) {
+        const logWithClearedAnalysis = { ...updatedLogs[key] };
+        delete logWithClearedAnalysis.aiAnalysis;
+        
+        const logPath = `users/${user.uid}/logs/${key}`;
+        try {
+          await setDoc(doc(db, 'users', user.uid, 'logs', key), logWithClearedAnalysis);
+        } catch (error) {
+          handleFirestoreError(error, OperationType.WRITE, logPath);
+        }
+      }
 
       setNotificationMsg("¡Ciclo recalculado con éxito!");
       setShowNotification(true);
       setTimeout(() => setShowNotification(false), 3000);
     }
   };
+
+  if (isLoadingAuth) {
+    return (
+      <div className="min-h-screen bg-[#FAF8F5] flex flex-col items-center justify-center p-6 text-center animate-pulse">
+        <span className="text-4xl">🌸</span>
+        <h2 className="text-xl font-serif font-semibold text-[#5A5A40] mt-4">Iniciando Cyclia...</h2>
+        <p className="text-xs text-[#9A9A90] mt-1">Conectando de forma segura con Firebase</p>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-[#FAF8F5] flex flex-col items-center justify-center p-6 text-center">
+        <div className="bg-white rounded-[32px] p-8 md:p-10 shadow-sm border border-[#F0EDE8] max-w-md w-full flex flex-col items-center gap-6 animate-fade-in">
+          <div className="w-16 h-16 bg-[#5A5A40] rounded-full flex items-center justify-center text-3xl shadow-xs">
+            🌸
+          </div>
+          <div>
+            <h1 className="text-3xl font-serif font-semibold tracking-tight text-[#5A5A40]">Cyclia</h1>
+            <p className="text-xs uppercase tracking-widest text-[#9A9A90] font-bold mt-1">Bienestar Femenino Inteligente</p>
+          </div>
+          <p className="text-xs text-[#7A7A70] leading-relaxed">
+            Bienvenida a Cyclia. Conéctate con tu cuenta para guardar de forma segura tus datos biológicos, fases del ciclo y análisis en la nube de Firebase.
+          </p>
+
+          <button
+            onClick={async () => {
+              try {
+                await signInWithPopup(auth, googleProvider);
+              } catch (err) {
+                console.error("Error al iniciar sesión:", err);
+              }
+            }}
+            className="w-full bg-[#5A5A40] hover:bg-[#484833] text-white font-semibold py-3 px-6 rounded-full text-xs uppercase tracking-wider transition-all cursor-pointer flex items-center justify-center gap-2.5 shadow-xs"
+          >
+            <svg className="w-4 h-4 fill-current" viewBox="0 0 24 24">
+              <path d="M12.24 10.285V13.4h6.887C18.2 15.614 15.645 18 12.24 18c-3.86 0-7-3.14-7-7s3.14-7 7-7c1.73 0 3.3.63 4.5 1.665L19.1 3.3C17.24 1.577 14.86.5 12.24.5a10.5 10.5 0 000 21c5.805 0 10.76-4.115 10.76-10.5 0-.715-.065-1.405-.18-2.065H12.24z"/>
+            </svg>
+            Iniciar Sesión con Google
+          </button>
+          
+          <div className="text-[10px] text-[#9A9A90] font-medium leading-relaxed max-w-[280px]">
+            Conectado de manera segura con Google Authentication y Firestore Database
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (!profile) {
     return (
@@ -379,6 +517,17 @@ Basado en tus registros de la fase **${phase}** (Día ${cycleDay} del ciclo), tu
               >
                 ⚙️ Editar Salud
               </button>
+              <button 
+                onClick={async () => {
+                  if (confirm("¿Estás segura de que deseas cerrar sesión?")) {
+                    await signOut(auth);
+                  }
+                }} 
+                className="text-[9px] bg-red-50 text-red-600 hover:bg-red-100 font-bold px-2 py-0.5 rounded-full transition-colors cursor-pointer"
+                title="Cerrar sesión"
+              >
+                Cerrar Sesión
+              </button>
             </div>
             <p className="text-sm font-semibold text-[#5A5A40] mt-0.5">{formatFriendlyDate(selectedDateStr)}</p>
           </div>
@@ -402,6 +551,17 @@ Basado en tus registros de la fase **${phase}** (Día ${cycleDay} del ciclo), tu
               title="Restaurar valores de la App"
             >
               🔄
+            </button>
+            <button
+              onClick={async () => {
+                if (confirm("¿Estás segura de que deseas cerrar sesión?")) {
+                  await signOut(auth);
+                }
+              }}
+              className="w-9 h-9 rounded-full border border-red-200 hover:bg-red-50 text-red-500 flex items-center justify-center text-xs transition-colors cursor-pointer sm:hidden"
+              title="Cerrar sesión"
+            >
+              🚪
             </button>
           </div>
         </div>
